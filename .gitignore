@@ -1,0 +1,126 @@
+# ==========================================
+# FlowSpace Project GitIgnore
+# ==========================================
+
+# ------------------------------------------
+# Operating System & IDE Files
+# ------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.bak
+*.tmp
+*.temp
+
+# IDEs & Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.user
+*.userosscache
+*.sln.docstates
+
+# ------------------------------------------
+# Environment Variables & Secrets
+# ------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ------------------------------------------
+# Databases & Backups
+# ------------------------------------------
+*.db
+*.db.bak
+*.sqlite
+*.sqlite3
+postgres_data/
+postgres_data_dev/
+
+# ------------------------------------------
+# Python & Backend
+# ------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+backend/logs/
+logs/
+
+# Backend Uploads & Generated Media/Reports
+uploads/
+backend/uploads/
+!uploads/.gitkeep
+!backend/uploads/.gitkeep
+backend/static/reports/
+static/reports/
+*.pdf
+
+# ------------------------------------------
+# Flutter / Dart / Frontend
+# ------------------------------------------
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+**/build/
+frontend/build/
+frontend/.dart_tool/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/analyze*.txt
+frontend/build_verbose.log
+
+# Android / iOS build artifacts
+**/android/app/debug/
+**/android/app/release/
+**/ios/Flutter/App.framework
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+
+# ------------------------------------------
+# Node / Web / Tooling
+# ------------------------------------------
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ------------------------------------------
+# Benchmark Reports & Temp Asset Organizers
+# ------------------------------------------
+FlowSpace_Asset_Review/
+FlowSpace_Library_Output/
+FlowSpace_Asset_Gap_Report.*
+final_asset_manifest.*
+final_deduplication_report.*
+new_assets_manifest.*
+new_assets_report.txt
+optimizer_benchmark_results.*
+remaining_gap_report.*
+

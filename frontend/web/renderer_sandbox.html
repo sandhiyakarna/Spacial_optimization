@@ -1,0 +1,1782 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>GPU Viewport Sandbox</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: transparent;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #viewport-container {
+      width: 100%;
+      height: 100%;
+      user-select: none;
+      background-color: transparent;
+    }
+    .status-text {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 14px;
+      color: #888888;
+      pointer-events: none;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+  <div id="viewport-container">
+    <div class="status-text" id="status-label">Initializing 3D Viewport...</div>
+  </div>
+
+  <div id="fps-counter" style="
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(15, 23, 42, 0.7);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-family: monospace;
+    font-size: 11px;
+    color: #e2e8f0;
+    pointer-events: none;
+    z-index: 1000;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    display: none;
+    min-width: 140px;
+  ">
+    <div style="font-weight: bold; color: #3b82f6; margin-bottom: 6px; font-size: 12px; letter-spacing: 0.05em;">GPU VIEWPORT</div>
+    <div style="margin-bottom: 2px;">FPS: <span id="val-fps" style="color: #10b981; font-weight: bold;">0</span></div>
+    <div style="margin-bottom: 2px;">Draw Calls: <span id="val-drawcalls" style="color: #f59e0b;">0</span></div>
+    <div style="margin-bottom: 2px;">Triangles: <span id="val-triangles">0</span></div>
+    <div style="margin-bottom: 2px;">Geometries: <span id="val-geometries">0</span></div>
+    <div style="margin-bottom: 2px;">Textures: <span id="val-textures">0</span></div>
+    <div>Models: <span id="val-models">0</span> <span id="val-culling" style="color: #94a3b8; font-size: 10px;">(0 culled)</span></div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // 2. CENTRALIZED CANONICAL UNIT CONVERSION: 100 cm = 1 THREE.JS WORLD UNIT
+    // =========================================================================
+    const CM_TO_WORLD_SCALE = 0.01;
+    function cmToWorld(cm) {
+      return (cm || 0.0) * CM_TO_WORLD_SCALE;
+    }
+    function worldToCm(world) {
+      return (world || 0.0) / CM_TO_WORLD_SCALE;
+    }
+
+    let scene, camera, renderer, controls, gridHelper, roomGroup, furnitureGroup, lightHelpersGroup, overlayGroup, transformControls, dimensionOverlayGroup;
+    let activeLights = new Map();
+    let roomMinX_cm = 0.0, roomMaxX_cm = 600.0, roomMinZ_cm = 0.0, roomMaxZ_cm = 450.0;
+    let roomHeight_cm = 280.0;
+    let shadowsEnabled = true;
+    let currentVisualizationMode = 'normal'; // 'normal' | 'debug_geometry' | 'collision' | 'ergonomic' | 'circulation'
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let isGizmoInteracting = false;
+
+    // Smart Dragging & Snapping configuration
+    let gridSnapEnabled = true;
+    let gridSnapSize_cm = 10.0; // 5, 10, 25, 50
+    let wallSnapEnabled = true;
+    let wallSnapThreshold_cm = 20.0;
+    let isDraggingObject = false;
+    let dragStartPos_cm = { x: 0, y: 0, z: 0 };
+    let activeDragObj = null;
+    let dragOffset_world = new THREE.Vector3();
+    const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const activePointers = new Map();
+
+    // Selection, highlight, collision, and multi-selection structures
+    let selectedIds = new Set();
+    let selectedBoxHelper = null;
+    let hoveredModel = null;
+    let hoverBoxHelper = null;
+    let isUpdatingTransform = false;
+
+    // Performance optimization structures
+    const textureCache = new Map();
+    const throttleTimers = {};
+    let lastFpsTime = performance.now();
+    let frames = 0;
+    let currentFps = 0;
+    let showFpsOverlay = false;
+    let frameCount = 0;
+    let culledModelsCount = 0;
+
+    function sendEventThrottled(type, payload, delay = 33) {
+      const now = Date.now();
+      const key = `${type}_${payload.id}`;
+      const lastTime = throttleTimers[key] || 0;
+      if (now - lastTime >= delay) {
+        window.RendererAdapterInstance.sendEvent(type, payload);
+        throttleTimers[key] = now;
+      }
+    }
+
+    function checkCollisions(activeObj) {
+      const val = validatePlacementStatus(activeObj);
+      return val.isBlocking;
+    }
+
+    function validatePlacementStatus(activeObj) {
+      if (!activeObj) return { state: 'SAFE', reason: '', isBlocking: false };
+      const activeBox = new THREE.Box3().setFromObject(activeObj);
+      const centerCm = {
+        x: worldToCm(activeObj.position.x),
+        z: worldToCm(activeObj.position.z)
+      };
+
+      // 1. Outside Room Bounds check
+      const margin = 2.0; // 2cm tolerance
+      if (
+        activeBox.min.x < cmToWorld(roomMinX_cm - margin) ||
+        activeBox.max.x > cmToWorld(roomMaxX_cm + margin) ||
+        activeBox.min.z < cmToWorld(roomMinZ_cm - margin) ||
+        activeBox.max.z > cmToWorld(roomMaxZ_cm + margin)
+      ) {
+        return {
+          state: 'COLLISION',
+          reason: 'Placement blocked — extends outside room boundaries',
+          isBlocking: true
+        };
+      }
+
+      // 2. Check against other active models
+      for (const [id, inst] of activeModels.entries()) {
+        if (inst === activeObj) continue;
+        const otherBox = new THREE.Box3().setFromObject(inst);
+        if (activeBox.intersectsBox(otherBox)) {
+          const name = inst.userData.name || 'other furniture';
+          return {
+            state: 'COLLISION',
+            reason: `Placement blocked — overlaps ${name}`,
+            isBlocking: true
+          };
+        }
+      }
+
+      // 3. Check against walls
+      let wallCollisionName = null;
+      if (roomGroup) {
+        roomGroup.traverse((child) => {
+          if (child.isMesh && child.userData.isWall) {
+            const wallBox = new THREE.Box3().setFromObject(child);
+            if (activeBox.intersectsBox(wallBox)) {
+              wallCollisionName = child.userData.name || 'Wall';
+            }
+          }
+        });
+      }
+      if (wallCollisionName) {
+        return {
+          state: 'COLLISION',
+          reason: 'Placement blocked — intersects the wall',
+          isBlocking: true
+        };
+      }
+
+      // 4. Ergonomic clearance check (warning if within 40cm of another item or wall)
+      const ergoBox = activeBox.clone().expandByScalar(cmToWorld(20.0));
+      for (const [id, inst] of activeModels.entries()) {
+        if (inst === activeObj) continue;
+        const otherBox = new THREE.Box3().setFromObject(inst);
+        if (ergoBox.intersectsBox(otherBox)) {
+          const name = inst.userData.name || 'item';
+          return {
+            state: 'ERGONOMIC_WARNING',
+            reason: `Ergonomic warning — low clearance near ${name}`,
+            isBlocking: false
+          };
+        }
+      }
+
+      return { state: 'SAFE', reason: 'Safe placement', isBlocking: false };
+    }
+
+    function logRenderBounds(assetId, assetName, obj) {
+      if (!obj) return;
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      console.log(`[RENDER BOUNDS] Asset: ${assetName} (${assetId}) Dimensions: ${worldToCm(size.x).toFixed(1)} x ${worldToCm(size.y).toFixed(1)} x ${worldToCm(size.z).toFixed(1)} cm`);
+    }
+
+    function initThree() {
+      const container = document.getElementById('viewport-container');
+      const statusLabel = document.getElementById('status-label');
+
+      // Create Scene
+      scene = new THREE.Scene();
+      scene.background = null;
+
+      // Create Camera (1 unit = 100 cm = 1 meter)
+      camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, cmToWorld(1.0), cmToWorld(50000.0));
+      camera.position.set(cmToWorld(600), cmToWorld(500), cmToWorld(600));
+
+      // Create Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.setClearColor(0x000000, 0);
+
+      // Tone Mapping & Lighting setup
+      renderer.physicallyCorrectLights = false;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.25;
+
+      container.appendChild(renderer.domElement);
+
+      // Create Orbit Controls
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.maxPolarAngle = Math.PI / 2 - 0.01; // Prevent camera going below floor
+      controls.minDistance = cmToWorld(20.0);
+      controls.maxDistance = cmToWorld(10000.0);
+
+      // Lights
+      activeLights = new Map();
+      shadowsEnabled = true;
+
+      // Hemisphere light for soft architectural ambient sky/ground fill
+      const hemiLight = new THREE.HemisphereLight(0xffffff, 0x475569, 1.15);
+      scene.add(hemiLight);
+      activeLights.set('ambient_global', hemiLight);
+
+      // Main key sun directional light with soft architectural shadows
+      const directionalLight = new THREE.DirectionalLight(0xfffdf5, 1.6);
+      directionalLight.position.set(cmToWorld(600), cmToWorld(900), cmToWorld(500));
+      directionalLight.castShadow = true;
+      setupShadowProperties(directionalLight);
+      scene.add(directionalLight);
+      activeLights.set('sun_global', directionalLight);
+
+      // Secondary soft bounce fill light (opposite corner) to brighten shaded surfaces
+      const fillLight = new THREE.DirectionalLight(0xdbeafe, 0.75);
+      fillLight.position.set(cmToWorld(-500), cmToWorld(600), cmToWorld(-500));
+      fillLight.castShadow = false;
+      scene.add(fillLight);
+      activeLights.set('fill_global', fillLight);
+
+      // Grid Helper (1 unit = 1 meter)
+      gridHelper = new THREE.GridHelper(cmToWorld(2000), 40, 0x475569, 0x334155);
+      gridHelper.position.y = cmToWorld(-0.1);
+      scene.add(gridHelper);
+
+      // Room & Furniture Groups
+      roomGroup = new THREE.Group();
+      scene.add(roomGroup);
+
+      furnitureGroup = new THREE.Group();
+      scene.add(furnitureGroup);
+
+      lightHelpersGroup = new THREE.Group();
+      scene.add(lightHelpersGroup);
+
+      overlayGroup = new THREE.Group();
+      scene.add(overlayGroup);
+
+      // Transform Controls
+      transformControls = new THREE.TransformControls(camera, renderer.domElement);
+      transformControls.addEventListener('dragging-changed', function (event) {
+        controls.enabled = !event.value;
+        if (!event.value) {
+          const obj = transformControls.object;
+          if (!obj) return;
+          
+          let instanceId = null;
+          for (const [id, inst] of activeModels.entries()) {
+            if (inst === obj) {
+              instanceId = id;
+              break;
+            }
+          }
+          if (instanceId) {
+            window.RendererAdapterInstance.sendEvent("OBJECT_MOVED", {
+              id: instanceId,
+              x: worldToCm(obj.position.x),
+              y: worldToCm(obj.position.y),
+              z: worldToCm(obj.position.z)
+            });
+          }
+        }
+      });
+      scene.add(transformControls);
+
+      // Setup Pointer & Mouse Interaction
+      setupInteractions(renderer.domElement);
+
+      if (statusLabel) statusLabel.style.display = 'none';
+
+      window.addEventListener('resize', onWindowResize, false);
+      animate();
+
+      window.RendererAdapterInstance.sendEvent("READY", { status: "ready" });
+    }
+
+    function fitCameraToRoom() {
+      if (!roomGroup) return;
+      const box = new THREE.Box3().setFromObject(roomGroup);
+      let center = new THREE.Vector3();
+      let size = new THREE.Vector3();
+
+      if (box.isEmpty() || !isFinite(box.min.x)) {
+        const rLen = roomMaxX_cm - roomMinX_cm || 500.0;
+        const rWid = roomMaxZ_cm - roomMinZ_cm || 400.0;
+        center.set(cmToWorld(roomMinX_cm + rLen / 2), cmToWorld(roomHeight_cm / 2), cmToWorld(roomMinZ_cm + rWid / 2));
+        size.set(cmToWorld(rLen), cmToWorld(roomHeight_cm), cmToWorld(rWid));
+      } else {
+        box.getCenter(center);
+        box.getSize(size);
+      }
+
+      const maxDim = Math.max(size.x, size.z, cmToWorld(350.0));
+      const dist = maxDim * 1.55;
+
+      camera.position.set(
+        center.x + dist * 0.75,
+        cmToWorld(roomHeight_cm) + dist * 0.65,
+        center.z + dist * 0.75
+      );
+      const targetPos = new THREE.Vector3(center.x, cmToWorld(40.0), center.z);
+      camera.lookAt(targetPos);
+
+      if (controls) {
+        controls.target.copy(targetPos);
+        controls.minDistance = maxDim * 0.1;
+        controls.maxDistance = maxDim * 10.0;
+        controls.update();
+      }
+    }
+
+    function setCameraView(preset) {
+      const box = new THREE.Box3().setFromObject(roomGroup);
+      let center = new THREE.Vector3();
+      let size = new THREE.Vector3();
+
+      if (box.isEmpty() || !isFinite(box.min.x)) {
+        const rLen = roomMaxX_cm - roomMinX_cm || 600.0;
+        const rWid = roomMaxZ_cm - roomMinZ_cm || 450.0;
+        center.set(cmToWorld(roomMinX_cm + rLen / 2), cmToWorld(roomHeight_cm / 2), cmToWorld(roomMinZ_cm + rWid / 2));
+        size.set(cmToWorld(rLen), cmToWorld(roomHeight_cm), cmToWorld(rWid));
+      } else {
+        box.getCenter(center);
+        box.getSize(size);
+      }
+
+      const maxDim = Math.max(size.x, size.y, size.z, cmToWorld(300.0));
+      const dist = maxDim * 1.6;
+
+      switch ((preset || '').toUpperCase()) {
+        case 'TOP':
+          camera.position.set(center.x, center.y + dist * 1.6, center.z + 0.001);
+          break;
+        case 'FRONT':
+          camera.position.set(center.x, center.y, center.z + dist * 1.4);
+          break;
+        case 'LEFT':
+          camera.position.set(center.x - dist * 1.4, center.y, center.z);
+          break;
+        case 'RIGHT':
+          camera.position.set(center.x + dist * 1.4, center.y, center.z);
+          break;
+        case 'WALKTHROUGH':
+          camera.position.set(center.x, cmToWorld(160.0), center.z); // eye level 160cm inside room
+          break;
+        case 'ISOMETRIC':
+        case 'RESET':
+        default:
+          camera.position.set(
+            center.x + dist * 0.75,
+            center.y + dist * 0.85,
+            center.z + dist * 0.75
+          );
+          break;
+      }
+
+      camera.lookAt(center);
+      if (controls) {
+        controls.target.copy(center);
+        controls.update();
+      }
+    }
+
+    function applyGridSnap(x_cm, z_cm) {
+      if (!gridSnapEnabled || gridSnapSize_cm <= 0) {
+        return { x: x_cm, z: z_cm };
+      }
+      return {
+        x: Math.round(x_cm / gridSnapSize_cm) * gridSnapSize_cm,
+        z: Math.round(z_cm / gridSnapSize_cm) * gridSnapSize_cm
+      };
+    }
+
+    function applyWallSnap(activeObj, targetPos_cm) {
+      if (!wallSnapEnabled || !roomGroup) return targetPos_cm;
+
+      const objBox = new THREE.Box3().setFromObject(activeObj);
+      const sizeWorld = new THREE.Vector3();
+      objBox.getSize(sizeWorld);
+      const halfW_cm = worldToCm(sizeWorld.x) / 2.0;
+      const halfD_cm = worldToCm(sizeWorld.z) / 2.0;
+
+      let resultX = targetPos_cm.x;
+      let resultZ = targetPos_cm.z;
+
+      // Check distance to room boundaries (minX, maxX, minZ, maxZ)
+      if (Math.abs((targetPos_cm.x - halfW_cm) - roomMinX_cm) < wallSnapThreshold_cm) {
+        resultX = roomMinX_cm + halfW_cm;
+      } else if (Math.abs((targetPos_cm.x + halfW_cm) - roomMaxX_cm) < wallSnapThreshold_cm) {
+        resultX = roomMaxX_cm - halfW_cm;
+      }
+
+      if (Math.abs((targetPos_cm.z - halfD_cm) - roomMinZ_cm) < wallSnapThreshold_cm) {
+        resultZ = roomMinZ_cm + halfD_cm;
+      } else if (Math.abs((targetPos_cm.z + halfD_cm) - roomMaxZ_cm) < wallSnapThreshold_cm) {
+        resultZ = roomMaxZ_cm - halfD_cm;
+      }
+
+      return { x: resultX, z: resultZ };
+    }
+
+    function updateSelectionOutline(instance) {
+      if (!selectedBoxHelper || !instance) return;
+      selectedBoxHelper.update();
+      const val = validatePlacementStatus(instance);
+      if (val.state === 'COLLISION') {
+        selectedBoxHelper.material.color.setHex(0xef4444); // Red
+      } else if (val.state === 'ERGONOMIC_WARNING') {
+        selectedBoxHelper.material.color.setHex(0xf59e0b); // Yellow
+      } else {
+        selectedBoxHelper.material.color.setHex(0x10b981); // Green
+      }
+    }
+
+    function setupInteractions(domElement) {
+      domElement.addEventListener('pointerdown', (e) => {
+        activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+        const rect = domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        // Two-finger touch gesture for camera navigation
+        if (activePointers.size > 1) {
+          if (controls) controls.enabled = true;
+          isDraggingObject = false;
+          activeDragObj = null;
+          return;
+        }
+
+        if (isGizmoInteracting) return;
+
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(furnitureGroup.children, true);
+
+        if (intersects.length > 0) {
+          let topGroup = intersects[0].object;
+          while (topGroup.parent && topGroup.parent !== furnitureGroup) {
+            topGroup = topGroup.parent;
+          }
+
+          let instanceId = null;
+          for (const [id, inst] of activeModels.entries()) {
+            if (inst === topGroup) {
+              instanceId = id;
+              break;
+            }
+          }
+
+          if (instanceId) {
+            selectModelInstance(instanceId);
+            window.RendererAdapterInstance.sendEvent("OBJECT_SELECTED", { id: instanceId });
+
+            // Start object drag setup
+            activeDragObj = topGroup;
+            dragStartPos_cm = {
+              x: worldToCm(topGroup.position.x),
+              y: worldToCm(topGroup.position.y),
+              z: worldToCm(topGroup.position.z)
+            };
+
+            floorPlane.constant = -topGroup.position.y;
+            const intersectPt = new THREE.Vector3();
+            if (raycaster.ray.intersectPlane(floorPlane, intersectPt)) {
+              dragOffset_world.copy(intersectPt).sub(topGroup.position);
+              isDraggingObject = true;
+              if (controls) controls.enabled = false; // Single finger on object moves object, not camera
+            }
+          }
+        } else {
+          selectModelInstance(null);
+          window.RendererAdapterInstance.sendEvent("OBJECT_DESELECTED", {});
+          if (controls) controls.enabled = true;
+        }
+      });
+
+      domElement.addEventListener('pointermove', (e) => {
+        if (activePointers.has(e.pointerId)) {
+          activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        }
+
+        if (!isDraggingObject || !activeDragObj || activePointers.size > 1) return;
+
+        const rect = domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        const intersectPt = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(floorPlane, intersectPt)) {
+          const targetWorld = intersectPt.sub(dragOffset_world);
+          let rawX_cm = worldToCm(targetWorld.x);
+          let rawZ_cm = worldToCm(targetWorld.z);
+
+          // 1. Grid snap
+          const gridPos = applyGridSnap(rawX_cm, rawZ_cm);
+          let finalX_cm = gridPos.x;
+          let finalZ_cm = gridPos.z;
+
+          // 2. Wall snap
+          const wallPos = applyWallSnap(activeDragObj, { x: finalX_cm, z: finalZ_cm });
+          finalX_cm = wallPos.x;
+          finalZ_cm = wallPos.z;
+
+          // Update Object 3D position
+          activeDragObj.position.x = cmToWorld(finalX_cm);
+          activeDragObj.position.z = cmToWorld(finalZ_cm);
+
+          // Update Selection Box Helper color
+          updateSelectionOutline(activeDragObj);
+
+          // Continuous live payload back to Flutter
+          const val = validatePlacementStatus(activeDragObj);
+          let instanceId = null;
+          for (const [id, inst] of activeModels.entries()) {
+            if (inst === activeDragObj) { instanceId = id; break; }
+          }
+
+          if (instanceId) {
+            sendEventThrottled("OBJECT_MOVING", {
+              id: instanceId,
+              x: finalX_cm,
+              y: worldToCm(activeDragObj.position.y),
+              z: finalZ_cm,
+              status: val.state,
+              reason: val.reason,
+              isBlocking: val.isBlocking
+            }, 30);
+          }
+        }
+      });
+
+      const handlePointerUp = (e) => {
+        activePointers.delete(e.pointerId);
+
+        if (isDraggingObject && activeDragObj) {
+          const val = validatePlacementStatus(activeDragObj);
+          let instanceId = null;
+          for (const [id, inst] of activeModels.entries()) {
+            if (inst === activeDragObj) { instanceId = id; break; }
+          }
+
+          if (val.isBlocking) {
+            // Revert invalid final placement
+            activeDragObj.position.x = cmToWorld(dragStartPos_cm.x);
+            activeDragObj.position.y = cmToWorld(dragStartPos_cm.y);
+            activeDragObj.position.z = cmToWorld(dragStartPos_cm.z);
+
+            updateSelectionOutline(activeDragObj);
+
+            if (instanceId) {
+              window.RendererAdapterInstance.sendEvent("PLACEMENT_BLOCKED", {
+                id: instanceId,
+                reason: val.reason,
+                revertedX: dragStartPos_cm.x,
+                revertedY: dragStartPos_cm.y,
+                revertedZ: dragStartPos_cm.z
+              });
+            }
+          } else {
+            // Accept valid final placement
+            if (instanceId) {
+              window.RendererAdapterInstance.sendEvent("OBJECT_MOVED", {
+                id: instanceId,
+                x: worldToCm(activeDragObj.position.x),
+                y: worldToCm(activeDragObj.position.y),
+                z: worldToCm(activeDragObj.position.z)
+              });
+            }
+          }
+
+          isDraggingObject = false;
+          activeDragObj = null;
+        }
+
+        if (controls) controls.enabled = true;
+      };
+
+      domElement.addEventListener('pointerup', handlePointerUp);
+      domElement.addEventListener('pointercancel', handlePointerUp);
+    }
+
+    function setupShadowProperties(light) {
+      if (!light) return;
+      light.shadow.mapSize.width = 2048;
+      light.shadow.mapSize.height = 2048;
+      light.shadow.camera.near = cmToWorld(10);
+      light.shadow.camera.far = cmToWorld(5000);
+      const d = cmToWorld(1500);
+      light.shadow.camera.left = -d;
+      light.shadow.camera.right = d;
+      light.shadow.camera.top = d;
+      light.shadow.camera.bottom = -d;
+      light.shadow.bias = -0.0005;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (controls) controls.update();
+
+      // Render scene
+      renderer.render(scene, camera);
+
+      // FPS tracking
+      frames++;
+      const now = performance.now();
+      if (now >= lastFpsTime + 1000) {
+        currentFps = Math.round((frames * 1000) / (now - lastFpsTime));
+        frames = 0;
+        lastFpsTime = now;
+        if (showFpsOverlay) {
+          const fpsEl = document.getElementById('val-fps');
+          if (fpsEl) fpsEl.innerText = currentFps;
+        }
+      }
+    }
+
+    function onWindowResize() {
+      const container = document.getElementById('viewport-container');
+      if (!container || !renderer || !camera) return;
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    }
+
+    function clearGroup(group) {
+      if (!group) return;
+      while (group.children.length > 0) {
+        const obj = group.children[0];
+        group.remove(obj);
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach(m => m.dispose());
+          } else {
+            obj.material.dispose();
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // 3. ROOM LOADING & ORIGIN (0, 0)
+    // =========================================================================
+    function loadRoom(payload) {
+      if (!payload) return;
+      clearGroup(roomGroup);
+
+      const walls = payload.walls || [];
+      const openings = payload.openings || [];
+      const openDoorIds = payload.openDoorIds || [];
+      roomHeight_cm = payload.height || 280.0;
+
+      // 1. Compute room bounds in cm
+      let roomLen_cm = 600.0;
+      let roomWid_cm = 450.0;
+      let minX_cm = 0.0, maxX_cm = 600.0;
+      let minZ_cm = 0.0, maxZ_cm = 450.0;
+
+      if (walls.length > 0) {
+        minX_cm = Infinity; maxX_cm = -Infinity;
+        minZ_cm = Infinity; maxZ_cm = -Infinity;
+        walls.forEach(w => {
+          minX_cm = Math.min(minX_cm, w.x1, w.x2);
+          maxX_cm = Math.max(maxX_cm, w.x1, w.x2);
+          minZ_cm = Math.min(minZ_cm, w.y1, w.y2);
+          maxZ_cm = Math.max(maxZ_cm, w.y1, w.y2);
+        });
+        roomLen_cm = maxX_cm - minX_cm;
+        roomWid_cm = maxZ_cm - minZ_cm;
+      }
+
+      roomMinX_cm = minX_cm;
+      roomMaxX_cm = maxX_cm;
+      roomMinZ_cm = minZ_cm;
+      roomMaxZ_cm = maxZ_cm;
+
+      const cx_cm = minX_cm + roomLen_cm / 2;
+      const cz_cm = minZ_cm + roomWid_cm / 2;
+
+      // 2. Render Floor (Canonical cmToWorld)
+      let floorColorHex = payload.floorMaterialColor || "#e2e8f0";
+      if (!payload.floorMaterialColor) {
+        if (payload.floorMaterialType === 'wood') floorColorHex = '#b45309';
+        else if (payload.floorMaterialType === 'carpet') floorColorHex = '#64748b';
+      }
+
+      const floorMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(floorColorHex),
+        roughness: payload.floorRoughness !== undefined ? Number(payload.floorRoughness) : 0.38,
+        metalness: payload.floorMetallic !== undefined ? Number(payload.floorMetallic) : 0.05,
+      });
+
+      const floorGeo = new THREE.BoxGeometry(cmToWorld(roomLen_cm), cmToWorld(4.0), cmToWorld(roomWid_cm));
+      const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+      floorMesh.position.set(cmToWorld(cx_cm), cmToWorld(-2.0), cmToWorld(cz_cm));
+      floorMesh.receiveShadow = true;
+      roomGroup.add(floorMesh);
+
+      // 3. Render Ceiling (Default OFF in isometric mode)
+      if (payload.showCeiling) {
+        const ceilingColorHex = payload.ceilingMaterialColor || "#ffffff";
+        const ceilingMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(ceilingColorHex),
+          roughness: 0.8,
+        });
+        const ceilingGeo = new THREE.BoxGeometry(cmToWorld(roomLen_cm), cmToWorld(4.0), cmToWorld(roomWid_cm));
+        const ceilingMesh = new THREE.Mesh(ceilingGeo, ceilingMat);
+        ceilingMesh.position.set(cmToWorld(cx_cm), cmToWorld(roomHeight_cm + 2.0), cmToWorld(cz_cm));
+        roomGroup.add(ceilingMesh);
+      }
+
+      // 4. Render Walls with Cutaway Presentation
+      const wallColorHex = payload.wallMaterialColor || "#f8fafc";
+      const wallRoughness = payload.wallRoughness !== undefined ? Number(payload.wallRoughness) : 0.5;
+
+      walls.forEach(w => {
+        const dx = w.x2 - w.x1;
+        const dz = w.y2 - w.y1;
+        const len = Math.sqrt(dx*dx + dz*dz);
+        if (len === 0) return;
+
+        const wallCenterX = w.x1 + dx / 2;
+        const wallCenterZ = w.y1 + dz / 2;
+        const angle = Math.atan2(dz, dx);
+
+        // Cutaway check: walls on camera-facing sides get lowered/translucent
+        const isFacingCamera = (wallCenterZ > cz_cm + roomWid_cm * 0.1 || wallCenterX > cx_cm + roomLen_cm * 0.1);
+
+        const wallMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(wallColorHex),
+          roughness: wallRoughness,
+          metalness: 0.0,
+          transparent: isFacingCamera,
+          opacity: isFacingCamera ? 0.35 : 1.0,
+        });
+
+        const effectiveHeight = (isFacingCamera && payload.fullWalls !== true) ? Math.min(roomHeight_cm, 50.0) : roomHeight_cm;
+
+        const wallGeo = new THREE.BoxGeometry(cmToWorld(len), cmToWorld(effectiveHeight), cmToWorld(w.thickness || 15.0));
+        const wallMesh = new THREE.Mesh(wallGeo, wallMat);
+        wallMesh.rotation.y = -angle;
+        wallMesh.position.set(cmToWorld(wallCenterX), cmToWorld(effectiveHeight / 2), cmToWorld(wallCenterZ));
+
+        wallMesh.castShadow = !isFacingCamera;
+        wallMesh.receiveShadow = true;
+        wallMesh.userData.isWall = true;
+        roomGroup.add(wallMesh);
+      });
+
+      // 5. Render Openings (Doors & Windows)
+      openings.forEach(op => {
+        if (op.type === 'door') {
+          const doorGroup = new THREE.Group();
+          doorGroup.position.set(cmToWorld(op.x), 0, cmToWorld(op.y));
+          doorGroup.rotation.y = -op.angle;
+
+          // Door Frame
+          const frameMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.6 });
+          const frameGeoSide = new THREE.BoxGeometry(cmToWorld(6.0), cmToWorld(215.0), cmToWorld(14.0));
+          const frameMeshL = new THREE.Mesh(frameGeoSide, frameMat);
+          frameMeshL.position.set(cmToWorld(-(op.width || 90.0)/2), cmToWorld(107.5), 0);
+          doorGroup.add(frameMeshL);
+
+          const frameMeshR = new THREE.Mesh(frameGeoSide, frameMat);
+          frameMeshR.position.set(cmToWorld((op.width || 90.0)/2), cmToWorld(107.5), 0);
+          doorGroup.add(frameMeshR);
+
+          const frameGeoTop = new THREE.BoxGeometry(cmToWorld(op.width || 90.0), cmToWorld(6.0), cmToWorld(14.0));
+          const frameMeshTop = new THREE.Mesh(frameGeoTop, frameMat);
+          frameMeshTop.position.set(0, cmToWorld(212.0), 0);
+          doorGroup.add(frameMeshTop);
+
+          // Door Leaf
+          const isOpen = openDoorIds.includes(op.id);
+          const leafMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.65 });
+          const leafGeo = new THREE.BoxGeometry(cmToWorld((op.width || 90.0) - 4.0), cmToWorld(208.0), cmToWorld(5.0));
+          const leafMesh = new THREE.Mesh(leafGeo, leafMat);
+          leafMesh.position.set(0, cmToWorld(104.0), 0);
+          if (isOpen) {
+            leafMesh.rotation.y = Math.PI / 2;
+            leafMesh.position.set(cmToWorld(-(op.width || 90.0)/2 + 2.0), cmToWorld(104.0), cmToWorld((op.width || 90.0)/2));
+          }
+          leafMesh.castShadow = true;
+          leafMesh.receiveShadow = true;
+          doorGroup.add(leafMesh);
+
+          // Brass Door Handle
+          const handleMat = new THREE.MeshStandardMaterial({ color: 0xd97706, metalness: 0.85, roughness: 0.25 });
+          const handleGeo = new THREE.BoxGeometry(cmToWorld(12.0), cmToWorld(3.0), cmToWorld(6.0));
+          const handleMesh = new THREE.Mesh(handleGeo, handleMat);
+          handleMesh.position.set(cmToWorld((op.width || 90.0)/2 - 12.0), cmToWorld(100.0), cmToWorld(4.0));
+          doorGroup.add(handleMesh);
+
+          roomGroup.add(doorGroup);
+        } else {
+          // Window
+          const winGroup = new THREE.Group();
+          winGroup.position.set(cmToWorld(op.x), 0, cmToWorld(op.y));
+          winGroup.rotation.y = -op.angle;
+
+          const winW = op.width || 120.0;
+          const winH = 140.0;
+          const winSillY = 90.0;
+          const winCenterY = winSillY + winH / 2.0;
+
+          // Charcoal Window Frame
+          const frameMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4 });
+          const sillGeo = new THREE.BoxGeometry(cmToWorld(winW + 12.0), cmToWorld(6.0), cmToWorld(18.0));
+          const sillMesh = new THREE.Mesh(sillGeo, frameMat);
+          sillMesh.position.set(0, cmToWorld(winSillY), 0);
+          winGroup.add(sillMesh);
+
+          const topFrameGeo = new THREE.BoxGeometry(cmToWorld(winW + 8.0), cmToWorld(6.0), cmToWorld(14.0));
+          const topFrameMesh = new THREE.Mesh(topFrameGeo, frameMat);
+          topFrameMesh.position.set(0, cmToWorld(winSillY + winH), 0);
+          winGroup.add(topFrameMesh);
+
+          const sideFrameGeo = new THREE.BoxGeometry(cmToWorld(6.0), cmToWorld(winH), cmToWorld(14.0));
+          const leftFrame = new THREE.Mesh(sideFrameGeo, frameMat);
+          leftFrame.position.set(cmToWorld(-winW / 2), cmToWorld(winCenterY), 0);
+          winGroup.add(leftFrame);
+
+          const rightFrame = new THREE.Mesh(sideFrameGeo, frameMat);
+          rightFrame.position.set(cmToWorld(winW / 2), cmToWorld(winCenterY), 0);
+          winGroup.add(rightFrame);
+
+          // Center divider mullion
+          const mullionGeo = new THREE.BoxGeometry(cmToWorld(4.0), cmToWorld(winH), cmToWorld(8.0));
+          const mullionMesh = new THREE.Mesh(mullionGeo, frameMat);
+          mullionMesh.position.set(0, cmToWorld(winCenterY), 0);
+          winGroup.add(mullionMesh);
+
+          // Translucent Sky Blue Glass Pane
+          const glassMat = new THREE.MeshStandardMaterial({
+            color: 0x93c5fd,
+            roughness: 0.1,
+            metalness: 0.1,
+            transparent: true,
+            opacity: 0.45
+          });
+          const glassGeo = new THREE.BoxGeometry(cmToWorld(winW - 6.0), cmToWorld(winH - 6.0), cmToWorld(2.0));
+          const glassMesh = new THREE.Mesh(glassGeo, glassMat);
+          glassMesh.position.set(0, cmToWorld(winCenterY), 0);
+          winGroup.add(glassMesh);
+
+          roomGroup.add(winGroup);
+        }
+      });
+
+      // Auto-fit camera to newly loaded room
+      fitCameraToRoom();
+    }
+
+    // =========================================================================
+    // 6, 7 & 9. GLB PARSER, SCALING & PIVOT NORMALIZATION
+    // =========================================================================
+    const modelCache = new Map();
+    const activeModels = new Map();
+
+    const GlbParser = {
+      parse(arrayBuffer) {
+        const dataView = new DataView(arrayBuffer);
+        const magic = dataView.getUint32(0, true);
+        if (magic !== 0x46546C67) throw new Error("Invalid GLB magic header");
+        const jsonChunkLen = dataView.getUint32(12, true);
+        const jsonText = new TextDecoder().decode(new Uint8Array(arrayBuffer, 20, jsonChunkLen));
+        const gltf = JSON.parse(jsonText);
+        const binChunkStart = 20 + jsonChunkLen;
+        let bin = null;
+        if (binChunkStart < arrayBuffer.byteLength) {
+          const binChunkLen = dataView.getUint32(binChunkStart, true);
+          bin = new Uint8Array(arrayBuffer, binChunkStart + 8, binChunkLen);
+        }
+        return { gltf, bin };
+      }
+    };
+
+    function getAccessorData(gltf, bin, accessorIdx) {
+      const accessor = gltf.accessors[accessorIdx];
+      const bufferView = gltf.bufferViews[accessor.bufferView];
+      const offset = (bufferView.byteOffset || 0) + (accessor.byteOffset || 0);
+      const count = accessor.count;
+      
+      let TypedArrayCtor = Float32Array;
+      if (accessor.componentType === 5121) TypedArrayCtor = Uint8Array;
+      else if (accessor.componentType === 5123) TypedArrayCtor = Uint16Array;
+      else if (accessor.componentType === 5125) TypedArrayCtor = Uint32Array;
+      
+      const numComponents = accessor.type === 'VEC3' ? 3 : (accessor.type === 'VEC2' ? 2 : (accessor.type === 'VEC4' ? 4 : 1));
+      const byteOffset = bin.byteOffset + offset;
+      const totalElements = count * numComponents;
+      const totalBytes = totalElements * TypedArrayCtor.BYTES_PER_ELEMENT;
+
+      // Handle unaligned buffer slice safely
+      if (byteOffset % TypedArrayCtor.BYTES_PER_ELEMENT === 0) {
+        return new TypedArrayCtor(bin.buffer, byteOffset, totalElements);
+      } else {
+        const slice = bin.buffer.slice(byteOffset, byteOffset + totalBytes);
+        return new TypedArrayCtor(slice);
+      }
+    }
+
+    function buildThreeMesh(gltf, bin) {
+      const group = new THREE.Group();
+      const threeMeshes = [];
+
+      (gltf.meshes || []).forEach(meshDef => {
+        const meshGroup = new THREE.Group();
+        meshDef.primitives.forEach(prim => {
+          const geometry = new THREE.BufferGeometry();
+          if (prim.attributes.POSITION !== undefined) {
+            const posData = getAccessorData(gltf, bin, prim.attributes.POSITION);
+            geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posData), 3));
+          }
+          if (prim.attributes.NORMAL !== undefined) {
+            const normData = getAccessorData(gltf, bin, prim.attributes.NORMAL);
+            geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normData), 3));
+          }
+          if (prim.attributes.TEXCOORD_0 !== undefined) {
+            const uvData = getAccessorData(gltf, bin, prim.attributes.TEXCOORD_0);
+            geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvData), 2));
+          }
+          if (prim.indices !== undefined) {
+            const indexData = getAccessorData(gltf, bin, prim.indices);
+            geometry.setIndex(new THREE.BufferAttribute(indexData, 1));
+          }
+
+          let materialColor = 0x8899a6;
+          let roughness = 0.6;
+          let metalness = 0.1;
+
+          if (prim.material !== undefined && gltf.materials && gltf.materials[prim.material]) {
+            const matDef = gltf.materials[prim.material];
+            if (matDef.pbrMetallicRoughness) {
+              const pbr = matDef.pbrMetallicRoughness;
+              if (pbr.baseColorFactor) {
+                materialColor = new THREE.Color(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
+              }
+              if (pbr.roughnessFactor !== undefined) roughness = pbr.roughnessFactor;
+              if (pbr.metallicFactor !== undefined) metalness = pbr.metallicFactor;
+            }
+          }
+
+          const material = new THREE.MeshStandardMaterial({
+            color: materialColor,
+            roughness: roughness,
+            metalness: metalness,
+          });
+
+          const mesh = new THREE.Mesh(geometry, material);
+          meshGroup.add(mesh);
+        });
+        threeMeshes.push(meshGroup);
+      });
+
+      threeMeshes.forEach(meshGroup => group.add(meshGroup));
+      return group;
+    }
+
+    async function loadGlbModel(url) {
+      if (modelCache.has(url)) return modelCache.get(url);
+      
+      const promise = new Promise((resolve, reject) => {
+        const attemptGltfLoader = () => {
+          if (typeof THREE.GLTFLoader !== 'undefined') {
+            const loader = new THREE.GLTFLoader();
+            loader.load(
+              url,
+              (gltf) => {
+                const rootScene = gltf.scene || gltf.scenes[0];
+                resolve(rootScene);
+              },
+              undefined,
+              (err) => {
+                attemptGlbParser();
+              }
+            );
+          } else {
+            attemptGlbParser();
+          }
+        };
+
+        const attemptGlbParser = () => {
+          fetch(url)
+            .then(res => {
+              if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+              return res.arrayBuffer();
+            })
+            .then(arrayBuffer => {
+              const { gltf, bin } = GlbParser.parse(arrayBuffer);
+              resolve(buildThreeMesh(gltf, bin));
+            })
+            .catch(reject);
+        };
+
+        attemptGltfLoader();
+      });
+      
+      modelCache.set(url, promise);
+      return promise;
+    }
+
+    let currentSelectedId = null;
+
+    function selectModelInstance(id) {
+      selectedIds.clear();
+      if (id) selectedIds.add(id);
+      currentSelectedId = id;
+
+      if (selectedBoxHelper) {
+        scene.remove(selectedBoxHelper);
+        selectedBoxHelper = null;
+      }
+
+      if (!id) {
+        if (transformControls) transformControls.detach();
+        return;
+      }
+
+      const instance = activeModels.get(id);
+      if (instance) {
+        selectedBoxHelper = new THREE.BoxHelper(instance, 0x3b82f6);
+        scene.add(selectedBoxHelper);
+
+        const hasCollision = checkCollisions(instance);
+        if (hasCollision) {
+          selectedBoxHelper.material.color.setHex(0xef4444);
+        }
+
+        if (transformControls) {
+          transformControls.attach(instance);
+          transformControls.setMode('translate');
+        }
+      }
+    }
+
+    function updateObjectMaterial(object, payload) {
+      if (!object || !payload) return;
+      const color = payload.color || payload.baseColor || payload.materialColor;
+      if (!color) return;
+
+      object.traverse((child) => {
+        if (child.isMesh && child.material) {
+          const materials = Array.isArray(child.material) ? child.material : [child.material];
+          materials.forEach((m) => {
+            m.color.set(color);
+            m.needsUpdate = true;
+          });
+        }
+      });
+    }
+
+    function createTextSprite(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 340;
+      canvas.height = 150;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+      ctx.fillRect(0, 0, 340, 150);
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(3, 3, 334, 144);
+      ctx.font = 'Bold 15px monospace';
+      ctx.fillStyle = '#ffffff';
+
+      const lines = text.split('\n');
+      lines.forEach((line, idx) => {
+        ctx.fillText(line, 14, 28 + idx * 22);
+      });
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+      const sprite = new THREE.Sprite(spriteMat);
+      sprite.scale.set(cmToWorld(140), cmToWorld(60), 1.0);
+      return sprite;
+    }
+
+    // =========================================================================
+    // 1 & 5 & 8. SCENE DIAGNOSTICS & OBB VERIFICATION
+    // =========================================================================
+    function runSceneDiagnostic(backendPayload) {
+      console.log("==================================================");
+      console.log("1. PRINT EVERY SCENE OBJECT");
+      console.log("==================================================");
+
+      const roomWidth = roomMaxX_cm - roomMinX_cm;
+      const roomLength = roomMaxZ_cm - roomMinZ_cm;
+      console.log(`ROOM:`);
+      console.log(`  width: ${roomWidth.toFixed(1)} cm`);
+      console.log(`  length: ${roomLength.toFixed(1)} cm`);
+      console.log(`  height: ${roomHeight_cm.toFixed(1)} cm`);
+
+      if (roomGroup) {
+        let wallIdx = 0;
+        roomGroup.traverse((child) => {
+          if (child.isMesh && child.userData.isWall) {
+            wallIdx++;
+            const box = new THREE.Box3().setFromObject(child);
+            const sz = new THREE.Vector3();
+            box.getSize(sz);
+            console.log(`Wall ${wallIdx}:`);
+            console.log(`  name: Wall_${wallIdx}`);
+            console.log(`  position: (${worldToCm(child.position.x).toFixed(1)}, ${worldToCm(child.position.y).toFixed(1)}, ${worldToCm(child.position.z).toFixed(1)}) cm`);
+            console.log(`  rotation: ${child.rotation.y.toFixed(4)} rad`);
+            console.log(`  width: ${worldToCm(sz.x).toFixed(1)} cm`);
+            console.log(`  height: ${worldToCm(sz.y).toFixed(1)} cm`);
+            console.log(`  depth: ${worldToCm(sz.z).toFixed(1)} cm`);
+          }
+        });
+      }
+
+      const backendFurniture = (backendPayload && backendPayload.furniture) ? backendPayload.furniture : [];
+
+      console.log("\nFURNITURE OBJECTS:");
+      for (const [id, inst] of activeModels.entries()) {
+        const assetId = inst.userData.assetId || id;
+        const name = inst.userData.name || 'Furniture';
+        const box = new THREE.Box3().setFromObject(inst);
+        const sz = new THREE.Vector3();
+        box.getSize(sz);
+
+        const bItem = backendFurniture.find(f => f.id === id || f.assetId === assetId) || {};
+
+        console.log(`Asset: ${name} (${assetId})`);
+        console.log(`  backendX: ${bItem.x !== undefined ? bItem.x.toFixed(1) : inst.userData.rawBackendX}`);
+        console.log(`  backendZ: ${bItem.z !== undefined ? bItem.z.toFixed(1) : inst.userData.rawBackendZ}`);
+        console.log(`  backendWidth: ${bItem.width !== undefined ? bItem.width.toFixed(1) : inst.userData.rawBackendWidth}`);
+        console.log(`  backendDepth: ${bItem.depth !== undefined ? bItem.depth.toFixed(1) : inst.userData.rawBackendDepth}`);
+        console.log(`  backendRotation: ${bItem.rotationY !== undefined ? bItem.rotationY.toFixed(4) : inst.userData.rawBackendRotation}`);
+
+        console.log(`  renderedX: ${worldToCm(inst.position.x).toFixed(1)} cm`);
+        console.log(`  renderedY: ${worldToCm(inst.position.y).toFixed(1)} cm`);
+        console.log(`  renderedZ: ${worldToCm(inst.position.z).toFixed(1)} cm`);
+        console.log(`  renderedWidth: ${worldToCm(sz.x).toFixed(1)} cm`);
+        console.log(`  renderedDepth: ${worldToCm(sz.z).toFixed(1)} cm`);
+        console.log(`  renderedHeight: ${worldToCm(sz.y).toFixed(1)} cm`);
+        console.log(`  renderedRotation: ${(-inst.rotation.y).toFixed(4)} rad`);
+      }
+
+      console.log("\n==================================================");
+      console.log("2. COMPARE BACKEND VS THREE.JS");
+      console.log("==================================================");
+      let hasMismatch = false;
+      const tolerance = 1.0; // 1 cm tolerance
+
+      for (const bItem of backendFurniture) {
+        const inst = activeModels.get(bItem.id);
+        if (!inst) {
+          console.error(`LAYOUT/RENDER MISMATCH: Item '${bItem.name}' (${bItem.id}) present in backend layout but missing in Three.js!`);
+          hasMismatch = true;
+          continue;
+        }
+        const diffX = Math.abs(bItem.x - worldToCm(inst.position.x));
+        const diffZ = Math.abs(bItem.z - worldToCm(inst.position.z));
+        const diffRot = Math.abs((bItem.rotationY || 0) - (-inst.rotation.y));
+
+        if (diffX > tolerance || diffZ > tolerance || diffRot > 0.05) {
+          console.error(`LAYOUT/RENDER MISMATCH for asset '${bItem.name}':`);
+          console.error(`  backend: (${bItem.x}, ${bItem.z}, rot=${bItem.rotationY}) vs rendered: (${worldToCm(inst.position.x)}, ${worldToCm(inst.position.z)}, rot=${-inst.rotation.y})`);
+          hasMismatch = true;
+        } else {
+          console.log(`MATCH VERIFIED: ${bItem.name}`);
+        }
+      }
+
+      console.log("\n==================================================");
+      console.log("3 & 8. VERIFY ROOM BOUNDS & OUTSIDE OBJECTS");
+      console.log("==================================================");
+      console.log(`Valid Room X: ${roomMinX_cm.toFixed(1)} <= X <= ${roomMaxX_cm.toFixed(1)} cm`);
+      console.log(`Valid Room Z: ${roomMinZ_cm.toFixed(1)} <= Z <= ${roomMaxZ_cm.toFixed(1)} cm`);
+
+      for (const [id, inst] of activeModels.entries()) {
+        const box = new THREE.Box3().setFromObject(inst);
+        const name = inst.userData.name || id;
+        const assetId = inst.userData.assetId || id;
+        const rawW = inst.userData.rawBackendWidth || worldToCm(box.max.x - box.min.x);
+        const rawD = inst.userData.rawBackendDepth || worldToCm(box.max.z - box.min.z);
+        const rawH = inst.userData.rawBackendHeight || worldToCm(box.max.y - box.min.y);
+        const rawRot = inst.userData.rawBackendRotation || 0.0;
+        const rawX = inst.userData.rawBackendX || worldToCm(inst.position.x);
+        const rawZ = inst.userData.rawBackendZ || worldToCm(inst.position.z);
+        const rawY = inst.userData.rawBackendY || 0.0;
+
+        const halfW = rawW / 2.0;
+        const halfD = rawD / 2.0;
+        const cosR = Math.abs(Math.cos(rawRot));
+        const sinR = Math.abs(Math.sin(rawRot));
+        const obbHalfW = halfW * cosR + halfD * sinR;
+        const obbHalfD = halfW * sinR + halfD * cosR;
+
+        const obbMinX = rawX - obbHalfW;
+        const obbMaxX = rawX + obbHalfW;
+        const obbMinZ = rawZ - obbHalfD;
+        const obbMaxZ = rawZ + obbHalfD;
+
+        const isInside = (obbMinX >= roomMinX_cm - 1.0 && obbMaxX <= roomMaxX_cm + 1.0 && obbMinZ >= roomMinZ_cm - 1.0 && obbMaxZ <= roomMaxZ_cm + 1.0);
+        console.log(`Asset: ${name} (${assetId})`);
+        console.log(`  OBB: minX=${obbMinX.toFixed(1)}, maxX=${obbMaxX.toFixed(1)}, minZ=${obbMinZ.toFixed(1)}, maxZ=${obbMaxZ.toFixed(1)} cm`);
+        console.log(`  insideRoom: ${isInside}`);
+
+        if (!isInside) {
+          console.error("==================================================");
+          console.error("OUTSIDE ROOM OBJECT ERROR");
+          console.error(`  assetId: ${assetId}`);
+          console.error(`  assetName: ${name}`);
+          console.error(`  backend position: (${rawX.toFixed(1)}, ${rawY.toFixed(1)}, ${rawZ.toFixed(1)}) cm`);
+          console.error(`  rendered position: (${worldToCm(inst.position.x).toFixed(1)}, ${worldToCm(inst.position.y).toFixed(1)}, ${worldToCm(inst.position.z).toFixed(1)}) cm`);
+          console.error(`  backend dimensions: (${rawW.toFixed(1)}, ${rawD.toFixed(1)}, ${rawH.toFixed(1)}) cm`);
+          console.error(`  rendered dimensions: (${worldToCm(box.max.x - box.min.x).toFixed(1)}, ${worldToCm(box.max.z - box.min.z).toFixed(1)}, ${worldToCm(box.max.y - box.min.y).toFixed(1)}) cm`);
+          console.error(`  rotation: ${rawRot.toFixed(4)} rad`);
+          console.error(`  OBB: minX=${obbMinX.toFixed(1)}, maxX=${obbMaxX.toFixed(1)}, minZ=${obbMinZ.toFixed(1)}, maxZ=${obbMaxZ.toFixed(1)}`);
+          console.error("==================================================");
+        }
+      }
+
+      console.log("\n==================================================");
+      console.log("4. VERIFY FURNITURE COUNT");
+      console.log("==================================================");
+      console.log(`Backend final layout assets: ${backendFurniture.length}`);
+      console.log(`Three.js furniture objects: ${activeModels.size}`);
+      if (backendFurniture.length > 0 && backendFurniture.length !== activeModels.size) {
+        console.error(`STOP: LAYOUT/RENDER MISMATCH — Furniture counts differ! (Backend: ${backendFurniture.length}, Three.js: ${activeModels.size})`);
+      } else {
+        console.log("FURNITURE COUNT MATCH VERIFIED!");
+      }
+
+      console.log("\n==================================================");
+      console.log("5 & 6. VERIFY ACTUAL GLB LOADING & SCALE");
+      console.log("==================================================");
+      for (const [id, inst] of activeModels.entries()) {
+        const name = inst.userData.name || id;
+        const isGlbLoaded = !inst.userData.isPlaceholder && !inst.userData.glbFailed;
+        console.log(`Asset ID: ${inst.userData.assetId || id}`);
+        console.log(`Name: ${name}`);
+        console.log(`GLB loaded: ${isGlbLoaded}`);
+        if (!isGlbLoaded) {
+          console.error(`ASSET LOAD FAILED: ${name}`);
+        } else {
+          console.log(`Scale factors: X=${(inst.userData.scaleFactorX || 1).toFixed(4)}, Y=${(inst.userData.scaleFactorY || 1).toFixed(4)}, Z=${(inst.userData.scaleFactorZ || 1).toFixed(4)}`);
+        }
+      }
+
+      console.log("==================================================\n");
+
+      window.RendererAdapterInstance.sendEvent("DIAGNOSTIC_COMPLETED", {
+        roomWidth, roomLength, roomHeight: roomHeight_cm,
+        backendCount: backendFurniture.length,
+        renderedCount: activeModels.size,
+        hasMismatch
+      });
+    }
+
+    function createTextSprite(text, textColor = '#ffffff', bgColor = 'rgba(15, 23, 42, 0.85)') {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, 512, 256);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(3, 3, 506, 250);
+
+      ctx.font = 'Bold 28px monospace';
+      ctx.fillStyle = textColor;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      const lines = text.split('\n');
+      const lineHeight = 36;
+      const startY = 128 - ((lines.length - 1) * lineHeight) / 2;
+
+      lines.forEach((line, index) => {
+        ctx.fillText(line, 256, startY + index * lineHeight);
+      });
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true });
+      const sprite = new THREE.Sprite(spriteMaterial);
+      sprite.scale.set(cmToWorld(140), cmToWorld(70), 1.0);
+      return sprite;
+    }
+
+    // =========================================================================
+    // 14. VALIDATION OVERLAY / DEBUG SPATIAL MODE
+    // =========================================================================
+    function updateVisualizationOverlay(mode) {
+      currentVisualizationMode = mode || 'normal';
+      clearGroup(overlayGroup);
+
+      if (currentVisualizationMode === 'debug_geometry' || currentVisualizationMode === 'debug') {
+        // 1. Cyan Room Boundary Wireframe (Cyan: #06b6d4)
+        const roomLen = roomMaxX_cm - roomMinX_cm || 600.0;
+        const roomWid = roomMaxZ_cm - roomMinZ_cm || 450.0;
+        const cx = roomMinX_cm + roomLen / 2;
+        const cz = roomMinZ_cm + roomWid / 2;
+
+        const boundsGeo = new THREE.BoxGeometry(cmToWorld(roomLen), cmToWorld(roomHeight_cm), cmToWorld(roomWid));
+        const boundsEdges = new THREE.EdgesGeometry(boundsGeo);
+        const boundsLine = new THREE.LineSegments(boundsEdges, new THREE.LineBasicMaterial({ color: 0x06b6d4, linewidth: 2 }));
+        boundsLine.position.set(cmToWorld(cx), cmToWorld(roomHeight_cm / 2), cmToWorld(cz));
+        overlayGroup.add(boundsLine);
+
+        // 2. OBB Wireframes and Labels for each furniture object
+        for (const [id, inst] of activeModels.entries()) {
+          const box = new THREE.Box3().setFromObject(inst);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const center = new THREE.Vector3();
+          box.getCenter(center);
+
+          const hasCollision = checkCollisions(inst);
+
+          // OBB Box wireframe (Green = Valid, Red = Collision)
+          const obbGeo = new THREE.BoxGeometry(size.x, size.y, size.z);
+          const obbEdges = new THREE.EdgesGeometry(obbGeo);
+          const obbColor = hasCollision ? 0xef4444 : 0x10b981;
+          const obbLine = new THREE.LineSegments(obbEdges, new THREE.LineBasicMaterial({ color: obbColor, linewidth: 2 }));
+          obbLine.position.copy(center);
+          overlayGroup.add(obbLine);
+
+          // Yellow Ergonomic Warning Clearance Zone (Yellow: #f59e0b)
+          const ergoGeo = new THREE.BoxGeometry(size.x + cmToWorld(40.0), size.y, size.z + cmToWorld(40.0));
+          const ergoEdges = new THREE.EdgesGeometry(ergoGeo);
+          const ergoLine = new THREE.LineSegments(ergoEdges, new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.4 }));
+          ergoLine.position.copy(center);
+          overlayGroup.add(ergoLine);
+
+          // Label Sprite showing: name, X, Z, width, depth, rotation
+          const name = inst.userData.name || id;
+          const rawW = inst.userData.rawBackendWidth || worldToCm(size.x);
+          const rawD = inst.userData.rawBackendDepth || worldToCm(size.z);
+          const labelText = `${name}\nX: ${worldToCm(inst.position.x).toFixed(1)} Z: ${worldToCm(inst.position.z).toFixed(1)}\nW: ${rawW.toFixed(1)} D: ${rawD.toFixed(1)}\nRot: ${(-inst.rotation.y).toFixed(2)} rad`;
+          const labelSprite = createTextSprite(labelText);
+          labelSprite.position.set(center.x, size.y + cmToWorld(40.0), center.z);
+          overlayGroup.add(labelSprite);
+        }
+      } else if (currentVisualizationMode === 'collision') {
+        for (const [id, inst] of activeModels.entries()) {
+          if (checkCollisions(inst)) {
+            const box = new THREE.Box3().setFromObject(inst);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+
+            const redGeo = new THREE.BoxGeometry(size.x + cmToWorld(4), size.y + cmToWorld(4), size.z + cmToWorld(4));
+            const redMat = new THREE.MeshBasicMaterial({ color: 0xef4444, wireframe: true });
+            const redMesh = new THREE.Mesh(redGeo, redMat);
+            redMesh.position.copy(center);
+            overlayGroup.add(redMesh);
+          }
+        }
+      } else if (currentVisualizationMode === 'ergonomic') {
+        for (const [id, inst] of activeModels.entries()) {
+          const box = new THREE.Box3().setFromObject(inst);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const center = new THREE.Vector3();
+          box.getCenter(center);
+
+          const yelGeo = new THREE.BoxGeometry(size.x + cmToWorld(60), size.y, size.z + cmToWorld(60));
+          const yelMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.2, wireframe: true });
+          const yelMesh = new THREE.Mesh(yelGeo, yelMat);
+          yelMesh.position.copy(center);
+          overlayGroup.add(yelMesh);
+        }
+      } else if (currentVisualizationMode === 'circulation') {
+        const step = 30.0;
+        const dotGeo = new THREE.SphereGeometry(cmToWorld(3.0), 8, 8);
+        const dotMat = new THREE.MeshBasicMaterial({ color: 0x10b981 });
+
+        for (let x = roomMinX_cm + 20; x <= roomMaxX_cm - 20; x += step) {
+          for (let z = roomMinZ_cm + 20; z <= roomMaxZ_cm - 20; z += step) {
+            const pBox = new THREE.Box3(
+              new THREE.Vector3(cmToWorld(x - 5), 0, cmToWorld(z - 5)),
+              new THREE.Vector3(cmToWorld(x + 5), cmToWorld(40), cmToWorld(z + 5))
+            );
+            let blocked = false;
+            for (const [id, inst] of activeModels.entries()) {
+              if (pBox.intersectsBox(new THREE.Box3().setFromObject(inst))) {
+                blocked = true;
+                break;
+              }
+            }
+            if (!blocked) {
+              const dot = new THREE.Mesh(dotGeo, dotMat);
+              dot.position.set(cmToWorld(x), cmToWorld(1.0), cmToWorld(z));
+              overlayGroup.add(dot);
+            }
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // WINDOW MESSAGE LISTENER & ADAPTER BRIDGE
+    // =========================================================================
+    window.RendererAdapterInstance = {
+      sendEvent(type, payload, transactionId) {
+        const msg = JSON.stringify({
+          version: '1.0.0',
+          type: type,
+          transactionId: transactionId || 'tx_' + Date.now(),
+          payload: payload || {}
+        });
+        if (window.FlutterBridge) {
+          window.FlutterBridge.postMessage(msg);
+        } else if (window.parent) {
+          window.parent.postMessage(msg, '*');
+        }
+      },
+      receiveCommand(data) {
+        if (!data) return;
+        const { type, transactionId, payload } = data;
+
+        switch (type) {
+          case "HELLO":
+            this.sendEvent("READY", { status: "ready" }, transactionId);
+            break;
+          case "PING":
+            this.sendEvent("PONG", {}, transactionId);
+            break;
+          case "LOAD_ROOM":
+            loadRoom(payload);
+            break;
+          case "RUN_DIAGNOSTIC":
+            runSceneDiagnostic(payload);
+            break;
+          case "SET_VISUALIZATION_MODE": {
+            updateVisualizationOverlay(payload.mode || payload.visualizationMode);
+            break;
+          }
+          case "LOAD_MODEL": {
+            const { id, glbUrl, x, y, z, rotationX, rotationY, rotationZ, scaleX, scaleY, scaleZ, width, height, depth } = payload;
+
+            const existingInstance = activeModels.get(id);
+            if (existingInstance) {
+              if (transformControls && transformControls.object === existingInstance && transformControls.dragging) break;
+              const tolerance = 0.001;
+              const targetWorldX = cmToWorld(x);
+              const targetWorldY = cmToWorld(y);
+              const targetWorldZ = cmToWorld(z);
+
+              if (x !== undefined && Math.abs(existingInstance.position.x - targetWorldX) > tolerance) existingInstance.position.x = targetWorldX;
+              if (y !== undefined && Math.abs(existingInstance.position.y - targetWorldY) > tolerance) existingInstance.position.y = targetWorldY;
+              if (z !== undefined && Math.abs(existingInstance.position.z - targetWorldZ) > tolerance) existingInstance.position.z = targetWorldZ;
+
+              if (rotationX !== undefined || rotationY !== undefined || rotationZ !== undefined) {
+                const rx = rotationX !== undefined ? rotationX : -existingInstance.rotation.x;
+                const ry = rotationY !== undefined ? rotationY : -existingInstance.rotation.y;
+                const rz = rotationZ !== undefined ? rotationZ : -existingInstance.rotation.z;
+                existingInstance.rotation.set(-rx, -ry, -rz, 'YXZ');
+              }
+
+              const sfx = existingInstance.userData.scaleFactorX || 1.0;
+              const sfy = existingInstance.userData.scaleFactorY || 1.0;
+              const sfz = existingInstance.userData.scaleFactorZ || 1.0;
+
+              if (scaleX !== undefined) existingInstance.scale.x = (scaleX || 1.0) * sfx;
+              if (scaleY !== undefined) existingInstance.scale.y = (scaleY || 1.0) * sfy;
+              if (scaleZ !== undefined) existingInstance.scale.z = (scaleZ || 1.0) * sfz;
+
+              existingInstance.userData.rawBackendX = x;
+              existingInstance.userData.rawBackendY = y;
+              existingInstance.userData.rawBackendZ = z;
+              existingInstance.userData.rawBackendWidth = width;
+              existingInstance.userData.rawBackendHeight = height;
+              existingInstance.userData.rawBackendDepth = depth;
+              existingInstance.userData.rawBackendRotation = rotationY;
+
+              updateObjectMaterial(existingInstance.children[0] || existingInstance, payload);
+              break;
+            }
+
+            const targetW = width || 100.0;
+            const targetH = height || 100.0;
+            const targetD = depth || 100.0;
+
+            const pivotGroup = new THREE.Group();
+            pivotGroup.position.set(cmToWorld(x || 0), cmToWorld(y || 0), cmToWorld(z || 0));
+            pivotGroup.rotation.set(-(rotationX || 0), -(rotationY || 0), -(rotationZ || 0), 'YXZ');
+            pivotGroup.userData.assetId = payload.assetId;
+            pivotGroup.userData.name = payload.name;
+            pivotGroup.userData.rawBackendX = x;
+            pivotGroup.userData.rawBackendY = y;
+            pivotGroup.userData.rawBackendZ = z;
+            pivotGroup.userData.rawBackendWidth = targetW;
+            pivotGroup.userData.rawBackendHeight = targetH;
+            pivotGroup.userData.rawBackendDepth = targetD;
+            pivotGroup.userData.rawBackendRotation = rotationY;
+
+            furnitureGroup.add(pivotGroup);
+            activeModels.set(id, pivotGroup);
+
+            loadGlbModel(glbUrl).then((template) => {
+              const currentGroup = activeModels.get(id);
+              if (!currentGroup) return;
+
+              const model = template.clone();
+              const box = new THREE.Box3().setFromObject(model);
+              const nativeCenter = new THREE.Vector3();
+              box.getCenter(nativeCenter);
+              const nativeSize = new THREE.Vector3();
+              box.getSize(nativeSize);
+
+              // Center footprint at (0, 0) and base at y = 0
+              model.position.set(-nativeCenter.x, -box.min.y, -nativeCenter.z);
+
+              const targetW_w = cmToWorld(targetW);
+              const targetH_w = cmToWorld(targetH);
+              const targetD_w = cmToWorld(targetD);
+
+              const scaleFactorX = nativeSize.x > 0.0001 ? targetW_w / nativeSize.x : 1.0;
+              const scaleFactorY = nativeSize.y > 0.0001 ? targetH_w / nativeSize.y : 1.0;
+              const scaleFactorZ = nativeSize.z > 0.0001 ? targetD_w / nativeSize.z : 1.0;
+
+              console.log("==================================================");
+              console.log(`ASSET LOAD TRACE: ${payload.name} (${payload.assetId})`);
+              console.log(`  assetPath: ${glbUrl}`);
+              console.log(`  loadStatus: SUCCESS`);
+              console.log(`  nativeBoundingBox: ${nativeSize.x.toFixed(2)} x ${nativeSize.y.toFixed(2)} x ${nativeSize.z.toFixed(2)}`);
+              console.log(`  databaseWidth: ${targetW} cm`);
+              console.log(`  databaseDepth: ${targetD} cm`);
+              console.log(`  databaseHeight: ${targetH} cm`);
+              console.log(`  scale: (${scaleFactorX.toFixed(4)}, ${scaleFactorY.toFixed(4)}, ${scaleFactorZ.toFixed(4)})`);
+              console.log("==================================================");
+
+              currentGroup.userData.scaleFactorX = scaleFactorX;
+              currentGroup.userData.scaleFactorY = scaleFactorY;
+              currentGroup.userData.scaleFactorZ = scaleFactorZ;
+
+              currentGroup.scale.set(
+                (scaleX || 1.0) * scaleFactorX,
+                (scaleY || 1.0) * scaleFactorY,
+                (scaleZ || 1.0) * scaleFactorZ
+              );
+
+              model.traverse((child) => {
+                if (child.isMesh && child.material) {
+                  child.material = Array.isArray(child.material) ? child.material.map(m => m.clone()) : child.material.clone();
+                  child.castShadow = true;
+                  child.receiveShadow = true;
+                }
+              });
+
+              if (payload.color || payload.baseColor) {
+                updateObjectMaterial(model, payload);
+              }
+              currentGroup.add(model);
+
+              logRenderBounds(payload.assetId, payload.name, currentGroup);
+
+              if (id === currentSelectedId) {
+                selectModelInstance(id);
+              }
+            }).catch((err) => {
+              console.error("==================================================");
+              console.error(`ASSET LOAD ERROR: Asset ID '${payload.assetId || id}' (${payload.name}) failed to load from ${glbUrl}: ${err.message}`);
+              console.error("==================================================");
+              
+              const currentGroup = activeModels.get(id);
+              if (currentGroup) {
+                currentGroup.userData.glbFailed = true;
+
+                // Add visible fallback 3D box geometry with distinctive amber wireframe-accented appearance
+                const targetW_w = cmToWorld(targetW);
+                const targetH_w = cmToWorld(targetH);
+                const targetD_w = cmToWorld(targetD);
+                const fallbackGeo = new THREE.BoxGeometry(targetW_w, targetH_w, targetD_w);
+                const fallbackMat = new THREE.MeshStandardMaterial({
+                  color: 0xf59e0b,
+                  roughness: 0.7,
+                  metalness: 0.1,
+                  transparent: true,
+                  opacity: 0.85,
+                });
+                const fallbackMesh = new THREE.Mesh(fallbackGeo, fallbackMat);
+                fallbackMesh.position.set(0, targetH_w / 2.0, 0);
+                fallbackMesh.castShadow = true;
+                fallbackMesh.receiveShadow = true;
+
+                const wireMat = new THREE.LineBasicMaterial({ color: 0xb45309, linewidth: 2 });
+                const wireGeo = new THREE.WireframeGeometry(fallbackGeo);
+                const wireMesh = new THREE.LineSegments(wireGeo, wireMat);
+                wireMesh.position.set(0, targetH_w / 2.0, 0);
+
+                currentGroup.add(fallbackMesh);
+                currentGroup.add(wireMesh);
+
+                const errText = `FALLBACK GEOMETRY\nasset_id: ${payload.assetId || id}`;
+                const errSprite = createTextSprite(errText, '#f59e0b', 'rgba(120, 53, 15, 0.95)');
+                errSprite.position.set(0, cmToWorld((targetH || 100.0) / 2.0) + targetH_w / 2.0, 0);
+                currentGroup.add(errSprite);
+              }
+            });
+            break;
+          }
+          case "REMOVE_MODEL": {
+            const { id } = payload;
+            const instance = activeModels.get(id);
+            if (instance) {
+              if (transformControls && transformControls.object === instance) transformControls.detach();
+              furnitureGroup.remove(instance);
+              activeModels.delete(id);
+            }
+            break;
+          }
+          case "SELECT_OBJECT": {
+            selectModelInstance(payload.id);
+            break;
+          }
+          case "SET_GRID_SNAP": {
+            if (payload.enabled !== undefined) gridSnapEnabled = !!payload.enabled;
+            if (payload.step !== undefined) gridSnapSize_cm = Number(payload.step) || 10.0;
+            break;
+          }
+          case "SET_WALL_SNAP": {
+            if (payload.enabled !== undefined) wallSnapEnabled = !!payload.enabled;
+            break;
+          }
+          case "ROTATE_SELECTED": {
+            if (currentSelectedId) {
+              const inst = activeModels.get(currentSelectedId);
+              if (inst) {
+                const deltaDeg = payload.deltaDegrees || 0.0;
+                const setDeg = payload.degrees;
+                let curDeg = (-inst.rotation.y) * 180.0 / Math.PI;
+                let newDeg = setDeg !== undefined ? setDeg : (curDeg + deltaDeg);
+                
+                // Rotation Snap if requested
+                if (payload.snap) {
+                  const snapAngles = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, -15, -30, -45, -60, -75, -90, -105, -120, -135, -150, -165, -180];
+                  let closest = snapAngles[0];
+                  let minDiff = Math.abs(newDeg - closest);
+                  for (const a of snapAngles) {
+                    if (Math.abs(newDeg - a) < minDiff) {
+                      minDiff = Math.abs(newDeg - a);
+                      closest = a;
+                    }
+                  }
+                  if (minDiff < 7.5) newDeg = closest;
+                }
+
+                const newRad = newDeg * Math.PI / 180.0;
+                inst.rotation.y = -newRad;
+                updateSelectionOutline(inst);
+
+                this.sendEvent("OBJECT_ROTATED", {
+                  id: currentSelectedId,
+                  rotationYRad: newRad,
+                  rotationYDeg: newDeg
+                });
+              }
+            }
+            break;
+          }
+          case "DUPLICATE_SELECTED": {
+            if (currentSelectedId) {
+              this.sendEvent("DUPLICATE_REQUESTED", { id: currentSelectedId });
+            }
+            break;
+          }
+          case "DELETE_SELECTED": {
+            if (currentSelectedId) {
+              this.sendEvent("DELETE_REQUESTED", { id: currentSelectedId });
+            }
+            break;
+          }
+          case "SET_CAMERA_VIEW":
+          case "SET_CAMERA": {
+            const preset = payload.view || payload.preset || payload.mode || 'ISOMETRIC';
+            setCameraView(preset);
+            break;
+          }
+          case "FIT_CAMERA_TO_ROOM": {
+            fitCameraToRoom();
+            break;
+          }
+          case "SET_VISUALIZATION_MODE": {
+            updateVisualizationOverlay(payload.mode);
+            break;
+          }
+          case "GENERATE_IMAGE": {
+            fitCameraToRoom();
+            renderer.setSize(1920, 1080, false);
+            camera.aspect = 1920 / 1080;
+            camera.updateProjectionMatrix();
+
+            renderer.render(scene, camera);
+            const dataUrl = renderer.domElement.toDataURL('image/png');
+
+            const container = document.getElementById('viewport-container');
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.render(scene, camera);
+
+            this.sendEvent("IMAGE_GENERATED", { dataUrl: dataUrl }, transactionId);
+            break;
+          }
+        }
+      }
+    };
+
+    window.addEventListener('message', (event) => {
+      let data = event.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) { return; }
+      }
+      if (data && data.type) {
+        window.RendererAdapterInstance.receiveCommand(data);
+      }
+    });
+
+    // Auto-init on DOM load
+    document.addEventListener("DOMContentLoaded", () => {
+      initThree();
+    });
+  </script>
+</body>
+</html>
